@@ -1,18 +1,24 @@
-#import pyautogui
-#import keyboard
-import re, os, time
-#from ctypes import wintypes, windll, create_unicode_buffer, cdll
-import win32gui
-from threading import Thread, Event
-from plyer import utils; platform = utils.platform
-#from plyer.utils import platform
-from plyer import notification
-#
-import configparser
-from pynput import keyboard
+input("starting")
 
 from enum import Enum
+import re, os, time
+from threading import Thread, Event
 
+import configparser
+
+from pynput import keyboard
+import win32gui
+from plyer import utils; platform = utils.platform
+from plyer import notification
+#
+
+
+
+
+
+
+
+#-------------- utils --------------------
 class ProgramState(Enum):
     WAITING = 0
     SESSIONSTARTED = 1
@@ -20,14 +26,75 @@ class ProgramState(Enum):
 
 
 
+is_str_float = lambda s,can_be_whole=True: bool(re.match('^[0-9]+\.'+('?' if can_be_whole else '')+'[0-9]*$', s))
+is_str_hour_format = None
+convert_to_minutes = lambda min_str: 60 * float(min_str)
+get_focused_window_title = lambda: win32gui.GetWindowText(win32gui.GetForegroundWindow())
+
+
+def includesKeyWords(str, keywords_list):
+    if not str:
+        return False
+
+    for kw in keywords_list:
+        if kw in str:
+            return True
+    else:
+        return False
+
+
+stopping_left = 3
+
+AVOIDKEYWORDS = ['breaktime','breakTimeConfig']
+DEFUALTWINDOWSTOAVOID = ["action center","volume control","task manager","network connections"]
+
+
+DEFUALT_NOTIFICATION_SCHEDULES = {0.5,0.75, 0.9}
+
+
+def time_format(time_amount):
+
+    time_amount = int(time_amount)
+    if time_amount==0:
+        return "0 seconds"
+
+
+    output_parts = []
+    d=time_amount //(60*60)
+    if d:
+        output_parts.append(str(d)+' hour'+('s' if d>1 else ''))
+        time_amount %=(60*60)
+
+    d = time_amount // 60
+    if d:
+        output_parts.append(str(d)+' minute'+('s' if d>1 else ''))
+        time_amount %=60
+    if time_amount:
+        output_parts.append(str(time_amount)+' second'+('s' if time_amount>1 else ''))
+
+    if(len(output_parts)>1):
+        return ', '.join(output_parts[:-1]) + ' and ' + output_parts[-1]
+
+    return output_parts[0]
+
+
+# ------------------- config setup ----------------------------
+
 CONFIG_NAME = 'breakTimeConfig.ini'
 DEFUALT_CONFIG = """
 [settings]
 defualt break time = 3
 defualt session time = 30
-Strict Mode = True 
-stopping key = p
-#In Strict Mode, you can't stop a session in the middle of it or prevent a break
+stopping key = P
+#The stopping key currently can only be one character: a-z, A-Z, 0-9, !@#$ etc...
+amount of times allowed to stop = 3 
+#If you set it to 0, the app will be in strict mode, you won't be able to stop in the middle of a session or prevent a break.
+#If you leave empty, you can stop as many times as you want
+text for break time = 
+
+
+
+
 
 
 [windows to keep open]
@@ -36,18 +103,32 @@ volume control
 manager
 """
 
-AVOIDKEYWORDS = ['breaktime','breakTimeConfig']
-DEFUALTWINDOWSTOAVOID = ["action center","volume control","task manager","network connections"]
-
-
-DEFUALT_NOTIFICATION_SCHEDULES = {0.5,0.75, 0.9}
-
-#config.get("settings","defualt break time")
-
-
-
 
 config = configparser.ConfigParser(allow_no_value=True)
+
+def get_minutes_from_format(config_var_str):
+    if not config_var_str:
+        return None
+
+
+    if config_var_str.isnumeric():
+        return int(config_var_str)
+
+    if is_str_float(config_var_str, False):
+        return round(float(config_var_str)*60)
+
+    m = re.match('^(?P<hours>\d{1,2})\:(?P<minutes>\d{0,2})$',config_var_str)
+
+    if m:
+        hours = int(m.group('hours') or '0')
+        minutes = int(m.group('minutes') or '0')
+        if hours<24 and minutes<60:
+            return hours*60+minutes
+
+    return None
+
+
+
 
 
 def createConfig():
@@ -59,17 +140,32 @@ def createConfig():
 
 def readConfig():
     global config
-
+    global stopping_left
 #    'YELLOW.ini')
     if os.path.exists(CONFIG_NAME):
         config.read(CONFIG_NAME)
+        # checking for bad syntax from user
+
+        if len(config.get("settings", "stopping key")) != 1:
+            raise ValueError('The stopping key currently can only be one character: a-z, A-Z, 0-9, !@#$ etc...')
+
+        if not (is_str_float(config.get("settings", "defualt break time"))):
+            raise ValueError('The value for "defualt break time" in the config file is not a number or a float')
+
+        if not config.get("settings", "amount of times allowed to stop") \
+                or config.get("settings", "amount of times allowed to stop").isnumeric():
+            stopping_left = config.get("settings", "amount of times allowed to stop")
+            stopping_left = int(stopping_left) if stopping_left else None
+
+        else:
+            raise ValueError('The value for "amount of times allowed to stop" is not a whole number or empty')
+
     else:
-        createConfig()
+        createConfig() #The user won't be fast enough to modify the config here
 
-    # checking for bad syntax
 
-    #if config.get("settings","stopping key")
 
+# -------- keyboard controlller setup ---------------
 
 evnt = Event()
 
@@ -77,18 +173,20 @@ state = ProgramState.WAITING
 last_time_paused = None
 keybaord_con = keyboard.Controller()
 
+
 def on_press(key):
     global last_time_paused
+    global stopping_left
     try:
         #print("I can't stop, and you know why")
-        if(key.char == config.get("settings","stopping key")):
+        if(key.char == config.get("settings","stopping key") and state!= ProgramState.WAITING):
             focused_window_title = get_focused_window_title().lower()
 
             if 'breaktime' not in focused_window_title: #To make sure you won't stop a session from a different window
                 return
 
 
-            if config.getboolean('settings','Strict Mode'):
+            if stopping_left == 0:
                 print("I can't stop the session and you know why... :P")
                 return
 
@@ -103,6 +201,14 @@ def on_press(key):
                     print("Break stopped")
                     evnt.clear()
 
+            if stopping_left:
+                stopping_left -= 1
+                if stopping_left==0:
+                    print("next time you won't be able to stop...")
+                else:
+                    print("you have",stopping_left,"time"+('' if stopping_left==1 else 's'),"left to stop a session")
+
+
     except AttributeError:
         pass
         #print('special key {0} pressed'.format(key))
@@ -110,41 +216,37 @@ def on_press(key):
 
 
 
-
-
-
-
-
-
-is_str_numeric = lambda s: bool(re.match('^[0-9]+\.?[0-9]*$', s))
-convert_to_minutes = lambda min_str: 60 * float(min_str)
-get_focused_window_title = lambda: win32gui.GetWindowText(win32gui.GetForegroundWindow())
-
-
-
-def includesKeyWords(str, keywords_list):
-    if not str:
-        return False
-
-    for kw in keywords_list:
-        if kw in str:
-            return True
-    else:
-        return False
-
-
 def minimizeAllWindows():
 
-    focused_window_title = get_focused_window_title()
-    print("window",focused_window_title, "was opened during break!")
-    focused_window_title = focused_window_title.lower()
+    focused_window_title_raw = get_focused_window_title()
+
+    focused_window_title = focused_window_title_raw.lower()
 
     if focused_window_title and not includesKeyWords(focused_window_title,AVOIDKEYWORDS) \
             and not (focused_window_title in DEFUALTWINDOWSTOAVOID or focused_window_title in DEFUALTWINDOWSTOAVOID):
-
+        print('window "{}" was opened during break!'.format(focused_window_title_raw))
         with keybaord_con.pressed(keyboard.Key.cmd):
             keybaord_con.press('m')
             keybaord_con.release('m')
+
+
+
+# ---------- limit screen function ------------
+
+def breakTime(runningTime, runningRate):
+
+    startT = time.time()
+
+    while time.time()-startT < runningTime:
+        if not evnt.is_set():
+            evnt.set()
+            break
+
+        minimizeAllWindows()
+        time.sleep(runningRate)
+
+
+
 
 
 def limitScreen(screen_limit_duration, break_duration,notificationsChedules=None):
@@ -158,12 +260,14 @@ def limitScreen(screen_limit_duration, break_duration,notificationsChedules=None
     start_time = time.localtime()
     timeSlept = 0
 
+    """
     def check_for_event():
         if not evnt.is_set():
             evnt.set()
             return True
 
         return False
+    """
 
     def app_notifiy(title, message):
 
@@ -174,22 +278,22 @@ def limitScreen(screen_limit_duration, break_duration,notificationsChedules=None
             # displaying time
             timeout=300
         )
+        print(time.strftime("%H:%M:%S", time.localtime()),":",title)
 
 
     def sleptAggrigate(sleepTime):
         nonlocal timeSlept
-        print("waiting for ", str(sleepTime))
+        print("waiting for ", time_format(sleepTime))
         evnt.wait() #if the user pauses before the sleep, then wait and then keep sleeping
         waitedSince = time.time()
-        print("{}: break in {} minutes!".format(time.strftime("%H:%M:%S", time.localtime()), convertToMinutes(screen_limit_duration - timeSlept)))
-        app_notifiy("עוד {} דקות הפסקה".format(convertToMinutes(screen_limit_duration - timeSlept)),
-                "עברו {} דקות מאז תחילת הסשן ב {}".format(convertToMinutes(timeSlept),
-                                                          time.strftime("%H:%M:%S", start_time)))
+        #print("{}: break in {} minutes!".format(time.strftime("%H:%M:%S", time.localtime()), convertToMinutes(screen_limit_duration - timeSlept)))
+        app_notifiy(time_format(screen_limit_duration - timeSlept)+" till break time!",
+                time_format(timeSlept)+" passed since the session began at "+time.strftime("%H:%M:%S", start_time))
 
         time.sleep(sleepTime)
         if not evnt.is_set():
             evnt.wait()
-            print("wait for ", str(sleepTime-(last_time_paused-waitedSince)))
+            print("wait for ", time_format(sleepTime-(last_time_paused-waitedSince)))
             time.sleep(sleepTime-(last_time_paused-waitedSince)) #if the user pauses after the sleep, then wait and then keep sleepin
 
 
@@ -204,82 +308,66 @@ def limitScreen(screen_limit_duration, break_duration,notificationsChedules=None
 
         sleptAggrigate(screen_limit_duration*notificationTime-timeSlept)
 
-    print("{}: {}".format((time.strftime("%H:%M:%S", time.localtime())),
-                          "זמן הפסקה למשך {} דקות".format(convertToMinutes(break_duration))))
+    #print("{}: {}".format((time.strftime("%H:%M:%S", time.localtime())),"Take a break for {} minutes!".format(convertToMinutes(break_duration))))
 
     state = ProgramState.BREAKTIME
     app_notifiy(
-        title="זמן הפסקה",
-        message="זמן הפסקה למשך {} דקות".format(convertToMinutes(break_duration))
+        title="Break Time!",
+        message="Take a break for "+time_format(break_duration)
     )
 
-    timerDecorator(break_duration, 1, check_for_event)(minimizeAllWindows)()
-    app_notifiy("אתה יכול לחזור לעבוד","בהצלחה")
+    #timerDecorator(break_duration, 1, check_for_event)(minimizeAllWindows)()
+    breakTime(break_duration,1)
+    app_notifiy("Welcome Back!","Now you can go back to work!")
 
 
-def timerDecorator(runningTime, runningRate,checkToStop=None):
-
-    checkToStop = checkToStop or (lambda : True)
-    def decorator(func):
-        def inner(*args, **kwargs):
-            startT = time.time()
-
-            while time.time()-startT < runningTime:
-                if checkToStop():
-                    break
-
-                func(*args, **kwargs)
-                time.sleep(runningRate)
-
-        return inner
-
-    return decorator
 
 
 def run_session():
     global state
 
-    state = ProgramState.SESSIONSTARTED
-    session_time_str = input("How many minutes will this session be: ").strip() or config.get("settings","defualt session time")
 
-    while(not is_str_numeric(session_time_str)):
-        print(config.get("settings", "defualt session time"))
-        session_time_str = input("The input here or from the config file needs to be a number!\nhow many minutes: ").strip() or config.get("settings","defualt session time")
+    session_time = get_minutes_from_format(input("How many minutes will this session be: ").strip() or config.get("settings","defualt session time"))
+    break_time = get_minutes_from_format(config.get("settings","defualt break time"))
+
+    while(not session_time or not break_time): #Also check if bigger than zero in here and config input
+        session_time = get_minutes_from_format(input("The values for session time and break time needs"
+                                 " to be a number a float or in time format 'HH:MM' "
+                                 "\ncheck your config file or rewrite here how many minutes: ").strip())
         readConfig()
+        session_time = session_time or get_minutes_from_format(config.get("settings","defualt session time"))
+        break_time = get_minutes_from_format(config.get("settings", "defualt break time"))
+
+
 
     else:
-        print(config.get("settings","defualt break time"))
-        if not(is_str_numeric(config.get("settings","defualt break time"))):
-            raise ValueError('The value for "defualt break time" in the config file is not a number or a float')
-
-        limitScreen(convert_to_minutes(session_time_str),
-                    convert_to_minutes(config.get("settings","defualt break time")))
+        state = ProgramState.SESSIONSTARTED
+        limitScreen(session_time*60,break_time*60)
 
     evnt.wait()
     state = ProgramState.WAITING
 
 
 
-
-
-
 def main():
-    print('Welcome To BreakTime!')
-    readConfig() #setting up config
-    evnt.set()  # setting up the keybaord listener
-    listener = keyboard.Listener(
+    try:
+        print('Welcome To BreakTime!')
+        readConfig() #setting up config
+        evnt.set()  # setting up the keybaord listener
+        listener = keyboard.Listener(
         on_press=on_press)
-    listener.start()
-    while True:
+        listener.start()
+        while True:
 
-        #try:
-        run_session()
-        print("session ended")
-        #except Exception as error:
-            #print(error)
 
-        #finally:
-        input('For another session, press ENTER.\n')
+            run_session()
+            print("session ended")
+
+
+
+            input('For another session, press ENTER.\n')
+    except Exception as error:
+        print(error)
 
 
 
